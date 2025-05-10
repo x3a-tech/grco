@@ -23,15 +23,15 @@ type Server interface {
 	Stop(ctx context.Context)
 }
 
-type ServiceRegisterFunc func(s *grpc.Server)
+type ServiceRegisterFunc func(s grpc.ServiceRegistrar, srv any)
 
 // server управляет экземпляром gRPC сервера.
 type server struct {
-	cfg            *configo.GrpcServer
-	logger         logit.Logger
-	grpcServer     *grpc.Server
-	listener       net.Listener
-	serviceRegFunc ServiceRegisterFunc
+	cfg        *configo.GrpcServer
+	logger     logit.Logger
+	grpcServer *grpc.Server
+	listener   net.Listener
+	regFunc    ServiceRegisterFunc
 }
 
 // ClientParams содержит параметры для создания нового server.
@@ -57,9 +57,9 @@ func NewServer(params ServerParams) (*server, error) {
 	}
 
 	return &server{
-		cfg:            params.Config,
-		logger:         params.Logger,
-		serviceRegFunc: params.RegisterFunc,
+		cfg:     params.Config,
+		logger:  params.Logger,
+		regFunc: params.RegisterFunc,
 	}, nil
 }
 
@@ -208,8 +208,8 @@ func (s *server) Start(ctx context.Context) error {
 	}
 
 	// Регистрация пользовательских сервисов
-	if s.serviceRegFunc != nil {
-		s.serviceRegFunc(s.grpcServer)
+	if s.regFunc != nil {
+		s.regFunc(s.grpcServer, s)
 		l.Info(ctx, fmt.Sprintf("%s: user-defined services registered via RegisterFunc", op))
 	} else {
 		l.Warn(ctx, fmt.Sprintf("%s: no user-defined services registered (RegisterFunc was nil)", op))
