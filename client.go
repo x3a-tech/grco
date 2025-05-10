@@ -6,6 +6,8 @@ import (
 	"crypto/x509"
 	"fmt"
 	"github.com/x3a-tech/configo"
+	"go.uber.org/zap"
+	"google.golang.org/grpc/connectivity"
 	"os"
 	"time"
 
@@ -24,26 +26,30 @@ type Client[T any] interface {
 }
 
 type client[T any] struct {
-	conn   *grpc.ClientConn
-	cfg    *configo.GrpcClient
-	logger logit.Logger
-	native T
+	conn          *grpc.ClientConn
+	cfg           *configo.GrpcClient
+	reconnectChan chan struct{}
+	nativeFunc    func(cc grpc.ClientConnInterface) T
+	native        T
+	logger        logit.Logger
 }
 
 type ClientParams[T any] struct {
-	Cfg    *configo.GrpcClient
-	Logger logit.Logger
-	Native T
+	Cfg        *configo.GrpcClient
+	Logger     logit.Logger
+	NativeFunc func(cc grpc.ClientConnInterface) T
 }
 
 func NewClient[T any](params *ClientParams[T]) Client[T] {
 	return &client[T]{
-		cfg:    params.Cfg,
-		logger: params.Logger,
-		native: params.Native,
+		cfg:        params.Cfg,
+		logger:     params.Logger,
+		nativeFunc: params.NativeFunc,
 	}
 }
 
+// Connect устанавливает соединение с gRPC сервером, используя предоставленную конфигурацию.
+// Реализует логику повторных попыток подключения.
 // Connect устанавливает соединение с gRPC сервером, используя предоставленную конфигурацию.
 // Реализует логику повторных попыток подключения.
 func (c *client[T]) Connect(ctx context.Context) error {
@@ -76,23 +82,40 @@ func (c *client[T]) Connect(ctx context.Context) error {
 		c.logger.Infof(ctx, "Попытка подключения #%d/%d к %s...", attempt+1, c.cfg.ConnectMaxAttempts, target)
 
 		dialCtx, cancelDial := context.WithTimeout(ctx, c.cfg.DialTimeout)
-		conn, err := grpc.DialContext(dialCtx, target, dialOpts...)
+		conn, errDial := grpc.DialContext(dialCtx, target, dialOpts...)
 		cancelDial()
 
-		if err == nil {
+		if errDial == nil { // Используем errDial
 			c.conn = conn
+			c.native = c.nativeFunc(c.conn)
 			c.logger.Infof(ctx, "Успешное подключение к %s", target)
+
+			c.reconnectChan = make(chan struct{})
+			go c.monitorConnection(ctx)
+
+			go func(connCtx context.Context) {
+				ticker := time.NewTicker(time.Second * 10)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-connCtx.Done(): // Используем connCtx
+						c.logger.Info(connCtx, "Мониторинг соединения (тикер) остановлен из-за отмены контекста.")
+						return
+					case <-ticker.C:
+						c.checkConnection(connCtx)
+					}
+				}
+			}(ctx)
+
 			return nil
 		}
 
-		lastErr = err
-		c.logger.Warnf(ctx, "Попытка #%d/%d не удалась: %v. Следующая попытка через %v", attempt+1, c.cfg.ConnectMaxAttempts, err, currentBackoff)
+		lastErr = errDial // Используем errDial
+		c.logger.Warnf(ctx, "Попытка #%d/%d не удалась: %v. Следующая попытка через %v", attempt+1, c.cfg.ConnectMaxAttempts, errDial, currentBackoff)
 
-		// Если это не последняя попытка, ждем перед следующей
 		if attempt < c.cfg.ConnectMaxAttempts-1 {
 			select {
 			case <-time.After(currentBackoff):
-				// Увеличиваем backoff
 				currentBackoff = time.Duration(float64(currentBackoff) * c.cfg.ConnectBackoffMultiplier)
 				if currentBackoff > c.cfg.ConnectMaxBackoff {
 					currentBackoff = c.cfg.ConnectMaxBackoff
@@ -206,4 +229,62 @@ func (c *client[T]) GetConnection() *grpc.ClientConn {
 
 func (c *client[T]) Native() T {
 	return c.native
+}
+
+func (c *client[T]) monitorConnection(ctx context.Context) {
+	const op = "gcli.client.monitorConnection"
+	baseReconnectDelay := time.Second * 5 // Начальная задержка перед повторной попыткой после неудачного reconnect
+	maxReconnectDelay := time.Minute * 5  // Максимальная задержка
+	currentReconnectDelay := baseReconnectDelay
+
+	for {
+		select {
+		case <-ctx.Done():
+			c.logger.Info(ctx, op+": Мониторинг остановлен из-за отмены контекста.")
+			return
+		case <-c.reconnectChan:
+			c.logger.Warn(ctx, op+": Обнаружен разрыв соединения или сигнал к переподключению. Попытка переподключения...")
+			reconnectOpCtx, cancelReconnectOp := context.WithTimeout(ctx, c.cfg.DialTimeout*time.Duration(c.cfg.ConnectMaxAttempts+1)) // Примерный таймаут
+
+			err := c.reconnect(reconnectOpCtx) // Используем новый контекст для операции
+			cancelReconnectOp()                // Важно отменить контекст операции
+
+			if err != nil {
+				c.logger.Errorf(ctx, op+": Не удалось переподключиться после всех попыток: %v. Следующая попытка через %v", err, currentReconnectDelay)
+
+				select {
+				case <-time.After(currentReconnectDelay):
+					currentReconnectDelay *= 2
+					if currentReconnectDelay > maxReconnectDelay {
+						currentReconnectDelay = maxReconnectDelay
+					}
+				case <-ctx.Done():
+					c.logger.Info(ctx, op+": Ожидание перед повторным переподключением прервано отменой контекста.")
+					return
+				}
+			} else {
+				c.logger.Info(ctx, op+": Успешное переподключение.")
+				currentReconnectDelay = baseReconnectDelay // Сбрасываем задержку после успешного переподключения
+			}
+		}
+	}
+}
+
+func (c *client[T]) reconnect(ctx context.Context) error {
+	if err := c.Close(); err != nil {
+		c.logger.Warn(ctx, "Ошибка при закрытии старого соединения:", zap.Error(err))
+	}
+	return c.Connect(ctx)
+}
+
+func (c *client[T]) checkConnection(ctx context.Context) { // Добавлен параметр ctx
+	if c.conn == nil || c.conn.GetState() == connectivity.TransientFailure || c.conn.GetState() == connectivity.Shutdown {
+		c.logger.Warn(ctx, "checkConnection: Обнаружено состояние TransientFailure или Shutdown.") // Логируем с контекстом
+		select {
+		case c.reconnectChan <- struct{}{}:
+			c.logger.Info(ctx, "checkConnection: Сигнал на переподключение отправлен.")
+		default:
+			c.logger.Info(ctx, "checkConnection: Сигнал на переподключение уже был отправлен ранее или канал заблокирован.")
+		}
+	}
 }
